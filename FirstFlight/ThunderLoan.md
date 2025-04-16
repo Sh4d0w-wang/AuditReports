@@ -706,3 +706,249 @@ Add a check in ` deposit() ` to make it impossible to use it in the same block o
 For example, registring the block.number in a variable in ` flashloan() ` and checking it in ` deposit() `.
 
 
+
+## M-01.The liquidity provider's token can be permanently locked in contract
+
+### Summary
+
+If the owner calls the ` setAllowedToken ` function to remove a certain token, but a liquidity provider has already deposited that token into the pool, then the liquidity provider will never be able to redeem those funds afterward. 
+
+
+
+### Vulnerability Details
+
+This vulnerability is in the ` setAllowedToken ` function.
+
+```solidity
+function setAllowedToken(IERC20 token, bool allowed) external onlyOwner returns (AssetToken) {
+    if (allowed) {
+        ...
+    } else {
+        AssetToken assetToken = s_tokenToAssetToken[token];
+        delete s_tokenToAssetToken[token];
+        emit AllowedTokenSet(token, assetToken, allowed);
+        return assetToken;
+    }
+}
+```
+
+If the owner calls the function to remove a certain token, any liquidity provider who has already deposited that token will never be able to redeem the tokens.
+
+
+
+### Proof of Concept
+
+#### Test Case
+
+```solidity
+function testLockTokens() public setAllowedToken hasDeposits {
+    AssetToken assetToken = thunderLoan.getAssetFromToken(tokenA);
+    console.log("liquidityProvider tokenA Balance:", vm.toString(tokenA.balanceOf(address(assetToken))));
+    thunderLoan.setAllowedToken(tokenA, false);
+    vm.startPrank(liquidityProvider);
+    vm.expectRevert(
+        abi.encodeWithSelector(
+            ThunderLoan.ThunderLoan__NotAllowedToken.selector, 
+            address(tokenA));
+    );
+    thunderLoan.redeem(tokenA, type(uint256).max);
+    vm.stopPrank();
+}
+```
+
+#### Output
+
+```bash
+[PASS] testLockTokens() (gas: 2049470)
+Logs:
+  liquidityProvider tokenA Balance: 1000000000000000000000
+
+Traces:
+  [2109170] ThunderLoanTest::testLockTokens()
+    ├─ [7662] ERC1967Proxy::fallback() [staticcall]
+    │   ├─ [2648] ThunderLoan::owner() [delegatecall]
+    │   │   └─ ← [Return] ThunderLoanTest: [0x7FA9385bE102ac3EAc297483Dd6233D62b3e1496]
+    │   └─ ← [Return] ThunderLoanTest: [0x7FA9385bE102ac3EAc297483Dd6233D62b3e1496]
+    ├─ [0] VM::prank(ThunderLoanTest: [0x7FA9385bE102ac3EAc297483Dd6233D62b3e1496])
+    │   └─ ← [Return]
+    ├─ [1884002] ERC1967Proxy::fallback(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], true)
+    │   ├─ [1883482] ThunderLoan::setAllowedToken(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], true) [delegatecall]
+    │   │   ├─ [3421] ERC20Mock::name() [staticcall]
+    │   │   │   └─ ← [Return] "ERC20Mock"
+    │   │   ├─ [3487] ERC20Mock::symbol() [staticcall]
+    │   │   │   └─ ← [Return] "E20M"
+    │   │   ├─ [1808403] → new AssetToken@0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c
+    │   │   │   └─ ← [Return] 8683 bytes of code
+    │   │   ├─ emit AllowedTokenSet(token: ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], asset: AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c], allowed: true)
+    │   │   └─ ← [Return] AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c]
+    │   └─ ← [Return] AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c]
+    ├─ [0] VM::startPrank(0x000000000000000000000000000000000000007B)
+    │   └─ ← [Return]
+    ├─ [47273] ERC20Mock::mint(0x000000000000000000000000000000000000007B, 1000000000000000000000 [1e21])
+    │   ├─ emit Transfer(from: 0x0000000000000000000000000000000000000000, to: 0x000000000000000000000000000000000000007B, value: 1000000000000000000000 [1e21])
+    │   └─ ← [Stop]
+    ├─ [25234] ERC20Mock::approve(ERC1967Proxy: [0xc7183455a4C133Ae270771860664b6B7ec320bB1], 1000000000000000000000 [1e21])
+    │   ├─ emit Approval(owner: 0x000000000000000000000000000000000000007B, spender: ERC1967Proxy: [0xc7183455a4C133Ae270771860664b6B7ec320bB1], value: 1000000000000000000000 [1e21])
+    │   └─ ← [Return] true
+    ├─ [105453] ERC1967Proxy::fallback(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], 1000000000000000000000 [1e21])
+    │   ├─ [104936] ThunderLoan::deposit(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], 1000000000000000000000 [1e21]) [delegatecall]
+    │   │   ├─ [542] AssetToken::getExchangeRate() [staticcall]
+    │   │   │   └─ ← [Return] 1000000000000000000 [1e18]
+    │   │   ├─ [392] AssetToken::EXCHANGE_RATE_PRECISION() [staticcall]
+    │   │   │   └─ ← [Return] 1000000000000000000 [1e18]
+    │   │   ├─ emit Deposit(account: 0x000000000000000000000000000000000000007B, token: ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], amount: 1000000000000000000000 [1e21])
+    │   │   ├─ [47373] AssetToken::mint(0x000000000000000000000000000000000000007B, 1000000000000000000000 [1e21])
+    │   │   │   ├─ emit Transfer(from: 0x0000000000000000000000000000000000000000, to: 0x000000000000000000000000000000000000007B, value: 1000000000000000000000 [1e21])
+    │   │   │   └─ ← [Stop]
+    │   │   ├─ [2912] MockPoolFactory::getPool(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9]) [staticcall]
+    │   │   │   └─ ← [Return] MockTSwapPool: [0xffD4505B3452Dc22f8473616d50503bA9E1710Ac]
+    │   │   ├─ [310] MockTSwapPool::getPriceOfOnePoolTokenInWeth() [staticcall]
+    │   │   │   └─ ← [Return] 1000000000000000000 [1e18]
+    │   │   ├─ [3017] AssetToken::updateExchangeRate(3000000000000000000 [3e18])
+    │   │   │   ├─ emit ExchangeRateUpdated(newExchangeRate: 1003000000000000000 [1.003e18])
+    │   │   │   └─ ← [Stop]
+    │   │   ├─ [28711] ERC20Mock::transferFrom(0x000000000000000000000000000000000000007B, AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c], 1000000000000000000000 [1e21])
+    │   │   │   ├─ emit Approval(owner: 0x000000000000000000000000000000000000007B, spender: ERC1967Proxy: [0xc7183455a4C133Ae270771860664b6B7ec320bB1], value: 0)
+    │   │   │   ├─ emit Transfer(from: 0x000000000000000000000000000000000000007B, to: AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c], value: 1000000000000000000000 [1e21])
+    │   │   │   └─ ← [Return] true
+    │   │   └─ ← [Stop]
+    │   └─ ← [Return]
+    ├─ [0] VM::stopPrank()
+    │   └─ ← [Return]
+    ├─ [1712] ERC1967Proxy::fallback(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9]) [staticcall]
+    │   ├─ [1195] ThunderLoan::getAssetFromToken(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9]) [delegatecall]
+    │   │   └─ ← [Return] AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c]
+    │   └─ ← [Return] AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c]
+    ├─ [874] ERC20Mock::balanceOf(AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c]) [staticcall]
+    │   └─ ← [Return] 1000000000000000000000 [1e21]
+    ├─ [0] VM::toString(1000000000000000000000 [1e21]) [staticcall]
+    │   └─ ← [Return] "1000000000000000000000"
+    ├─ [0] console::log("liquidityProvider tokenA Balance:", "1000000000000000000000") [staticcall]
+    │   └─ ← [Stop]
+    ├─ [4515] ERC1967Proxy::fallback(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], false)
+    │   ├─ [3995] ThunderLoan::setAllowedToken(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], false) [delegatecall]
+    │   │   ├─ emit AllowedTokenSet(token: ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], asset: AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c], allowed: false)
+    │   │   └─ ← [Return] AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c]
+    │   └─ ← [Return] AssetToken: [0xa38D17ef017A314cCD72b8F199C0e108EF7Ca04c]
+    ├─ [0] VM::startPrank(0x000000000000000000000000000000000000007B)
+    │   └─ ← [Return]
+    ├─ [0] VM::expectRevert(custom error 0xf28dceb3: 0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000002483ebfce70000000000000000000000005991a2df15a8f6a256d3ec51e99254cd3fb576a900000000000000000000000000000000000000000000000000000000)
+    │   └─ ← [Return]
+    ├─ [1946] ERC1967Proxy::fallback(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], 115792089237316195423570985008687907853269984665640564039457584007913129639935 [1.157e77])
+    │   ├─ [1422] ThunderLoan::redeem(ERC20Mock: [0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9], 115792089237316195423570985008687907853269984665640564039457584007913129639935 [1.157e77]) [delegatecall]
+    │   │   └─ ← [Revert] ThunderLoan__NotAllowedToken(0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9)
+    │   └─ ← [Revert] ThunderLoan__NotAllowedToken(0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9)
+    ├─ [0] VM::stopPrank()
+    │   └─ ← [Return]
+    └─ ← [Stop]
+
+Suite result: ok. 1 passed; 0 failed; 0 skipped; finished in 4.34ms (1.83ms CPU time)
+```
+
+
+
+### Impact
+
+This vulnerability can lead to the loss of user's funds.
+
+
+
+### Recommendation
+
+Check if the balance of the token contract is zero before the owner remove the token.
+
+```solidity
+function setAllowedToken(IERC20 token, bool allowed) external onlyOwner returns (AssetToken) {
+    if (allowed) {
+        ...
+    } else {
+        AssetToken assetToken = s_tokenToAssetToken[token];
+        if (IERC20(token).balanceOf(address(assetToken)) == 0){
+            delete s_tokenToAssetToken[token];
+            emit AllowedTokenSet(token, assetToken, allowed);
+        }
+        return assetToken;
+    }
+}
+```
+
+
+
+## M-02.Attacker can manipulate the price of the oracle to control the fee
+
+### Summary
+
+Attacker can manipulate the price of the oracle to control the fee.
+
+
+
+### Vulnerability Details
+
+The protocol is using a liquidity pool on some exchange to return the price of an asset in WETH.
+
+```solidity
+function getPriceInWeth(address token) public view returns (uint256) {
+    address swapPoolOfToken = IPoolFactory(s_poolFactory).getPool(token);
+    return ITSwapPool(swapPoolOfToken).getPriceOfOnePoolTokenInWeth();
+}
+```
+
+The price is entirely dependent on ` s_poolFactory `, so attackers can manipulate the fee by controlling ` s_poolFactory `.
+
+
+
+### Impact
+
+The price is entirely manipulated by the attackers, resulting in a loss of profit.
+
+
+
+### Recommendation
+
+Use a manipulation-resistant oracle such as Chainlink. Do not use a liquidity pool to get prices.
+
+
+
+
+
+
+
+
+
+## M-03.The amount intended for deposit may differ from the catual amount deposited
+
+### Summary
+
+The amount intended for deposit may differ from the actual amount deposited, which inevitably leads to a loss of funds for some users.
+
+
+
+### Vulnerability Details
+
+Some tokens have a trading fee.
+
+For example, if you send 100 tokens with a fee of 0.3%, the recipient will only receive 99.7 tokens. However, in the ` deposit ` function, the input ` amount ` is directly stored without accounting for the fee. As a result, when User A wants to redeem his tokens, he might encounter an insufficient funds error. Alternatively, if User B also deposits the same token, part of User B's deposit might be used to fulfill User A's redemption request. This would lead to a loss of funds for User B or make it impossible for them to withdraw their tokens. Ultimately, there will definitely be users who cannot withdraw their tokens.
+
+```solidity
+function deposit(IERC20 token, uint256 amount) external revertIfZero(amount) revertIfNotAllowedToken(token) {
+    ...
+    uint256 mintAmount = (amount * assetToken.EXCHANGE_RATE_PRECISION()) / exchangeRate;
+    emit Deposit(msg.sender, token, amount);
+    assetToken.mint(msg.sender, mintAmount);
+    uint256 calculatedFee = getCalculatedFee(token, amount);
+    ...
+    token.safeTransferFrom(msg.sender, address(assetToken), amount);
+}
+```
+
+
+
+### Impact
+
+This vulnerability can lead to the loss of users.
+
+
+
+### Recommendation
+
+Deposit the amount based on the final amount received.
